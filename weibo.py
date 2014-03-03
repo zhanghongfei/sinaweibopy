@@ -9,11 +9,16 @@ Python client SDK for sina weibo API using OAuth 2.
 '''
 
 try:
+    import json
+except ImportError:
+    import simplejson as json
+
+try:
     from cStringIO import StringIO
 except ImportError:
     from StringIO import StringIO
 
-import gzip, time, json, hmac, base64, hashlib, urllib, urllib2, logging, mimetypes, collections
+import gzip, time, hmac, base64, hashlib, urllib, urllib2, logging, mimetypes, collections
 
 class APIError(StandardError):
     '''
@@ -94,6 +99,42 @@ def _encode_multipart(**kw):
     data.append('--%s--\r\n' % boundary)
     return '\r\n'.join(data), boundary
 
+def _pack_result_image(**kw):
+    '''Pack image from file into multipart-formdata post body'''
+
+    status = kw.get('status')
+    file_type = kw.get('content_type')
+    pic = kw.get('pic')
+
+    # image must be gif, jpeg, or png
+    if file_type not in ['image/gif', 'image/jpeg', 'image/png', 'image/pjpeg']:
+        raise WeibopError('Invalid file type for image: %s' % file_type)
+
+    # build the mulitpart-formdata body
+    BOUNDARY = 'Tw3ePy'
+    body = []
+    if status is not None:
+        body.append('--' + BOUNDARY)
+        body.append('Content-Disposition: form-data; name="status"')
+        body.append('Content-Type: text/plain; charset=US-ASCII')
+        body.append('Content-Transfer-Encoding: 8bit')
+        body.append('')
+        body.append(status.encode('utf-8'))
+    body.append('--' + BOUNDARY)
+    body.append('Content-Disposition: form-data; name="pic"; filename="%s"' % 'result.png')
+    body.append('Content-Type: %s' % file_type.encode('utf-8'))
+    body.append('Content-Transfer-Encoding: binary')
+    body.append('')
+    body.append(pic)
+    body.append('--' + BOUNDARY + '--')
+    body.append('')
+    # fp.close()
+    body.append('--' + BOUNDARY + '--')
+    body.append('')
+    body = '\r\n'.join(body)
+
+    return body, BOUNDARY
+
 def _guess_content_type(url):
     n = url.rfind('.')
     if n==(-1):
@@ -104,6 +145,7 @@ def _guess_content_type(url):
 _HTTP_GET = 0
 _HTTP_POST = 1
 _HTTP_UPLOAD = 2
+_HTTP_UPLOAD_STATUS = 3
 
 def _http_get(url, authorization=None, **kw):
     logging.info('GET %s' % url)
@@ -137,14 +179,20 @@ def _http_call(the_url, method, authorization, **kw):
         # fix sina upload url:
         the_url = the_url.replace('https://api.', 'https://upload.api.')
         params, boundary = _encode_multipart(**kw)
+    elif method == _HTTP_UPLOAD_STATUS:
+        # fix sina upload url:
+        the_url = the_url.replace('https://api.', 'https://upload.api.')
+        params, boundary = _pack_result_image(**kw)
     else:
         params = _encode_params(**kw)
         if '/remind/' in the_url:
             # fix sina remind api:
             the_url = the_url.replace('https://api.', 'https://rm.api.')
-    http_url = '%s?%s' % (the_url, params) if method==_HTTP_GET else the_url
-    http_body = None if method==_HTTP_GET else params
-    req = urllib2.Request(http_url, data=http_body)
+
+    req = urllib2.Request(
+        '%s?%s' % (the_url, params) if method==_HTTP_GET else the_url,
+        data=None if method==_HTTP_GET else params,
+    )
     req.add_header('Accept-Encoding', 'gzip')
     if authorization:
         req.add_header('Authorization', 'OAuth2 %s' % authorization)
@@ -176,7 +224,11 @@ class HttpObject(object):
         def wrap(**kw):
             if self.client.is_expires():
                 raise APIError('21327', 'expired_token', attr)
-            return _http_call('%s%s.json' % (self.client.api_url, attr.replace('__', '/')), self.method, self.client.access_token, **kw)
+            return _http_call(
+                '%s%s.json' % (self.client.api_url, attr.replace('__', '/')),
+                self.method,
+                self.client.access_token,
+                **kw)
         return wrap
 
 class APIClient(object):
@@ -195,6 +247,7 @@ class APIClient(object):
         self.get = HttpObject(self, _HTTP_GET)
         self.post = HttpObject(self, _HTTP_POST)
         self.upload = HttpObject(self, _HTTP_UPLOAD)
+        self.upload_status = HttpObject(self, _HTTP_UPLOAD_STATUS)
 
     def parse_signed_request(self, signed_request):
         '''
@@ -242,7 +295,7 @@ class APIClient(object):
                 _encode_params(client_id = self.client_id, \
                         response_type = response_type, \
                         redirect_uri = redirect, **kw))
-                        
+
     def _parse_access_token(self, r):
         '''
         new:return access token as a JsonDict: {"access_token":"your-access-token","expires_in":12345678,"uid":1234}, expires_in is represented using standard unix-epoch-time
@@ -255,8 +308,11 @@ class APIClient(object):
             if rtime < expires:
                 expires = rtime
         return JsonDict(access_token=r.access_token, expires=expires, expires_in=expires, uid=r.get('uid', None))
-        
+
     def request_access_token(self, code, redirect_uri=None):
+        '''
+        return access token as a JsonDict: {"access_token":"your-access-token","expires_in":12345678,"uid":1234}, expires_in is represented using standard unix-epoch-time
+        '''
         redirect = redirect_uri if redirect_uri else self.redirect_uri
         if not redirect:
             raise APIError('21305', 'Parameter absent: redirect_uri', 'OAuth2 request')
